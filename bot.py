@@ -14,7 +14,8 @@ if not os.path.exists(CONFIG_FILE):
         "owner_id": 0,
         "afk_vc_id": 0,
         "warning_channel_id": 0,
-        "banned_links": ["nustwin.com", "rackswin.com", "discord.gift", "nitro", "http", ".net", ".play", ".me", "invite"],
+        "whitelisted_channels": [],
+        "banned_links": ["nustwin.com", "rackswin.com", "discord.gift", "nitro", "http", ".net", ".play", ".me", "invite", "youtube.com", "youtu.be", "instagram.com"],
         "banned_words": ["bonus", "withdraw", "$2700", "nustwin", "rackswin", "mrbeast", "ip", ".play", ".net", "mera smp", "nitro", "baap", "maa", "hosting", "my server"],
         "banned_image_filenames": ["IMG_7192.jpg", "1f5f3f0b.jpg", "7c0f7032.jpg", "202384c9-1.jpg", "rackswin", "nustwin"]
     }
@@ -35,6 +36,175 @@ intents.guilds = True
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
+muted_users = set()
+warning_sent = False
+known_phishing_hashes = set()
+
+# Load phishing image hashes
+async def load_phishing_hashes():
+    phishing_files = [
+        "/home/workdir/attachments/IMG_7192.jpg",
+        "/home/workdir/attachments/1f5f3f0b.jpg",
+        "/home/workdir/attachments/7c0f7032.jpg",
+        "/home/workdir/attachments/202384c9-1.jpg"
+    ]
+    for path in phishing_files:
+        try:
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    data = f.read()
+                    known_phishing_hashes.add(hashlib.md5(data).hexdigest())
+                print(f"✅ Loaded hash for {os.path.basename(path)}")
+        except:
+            pass
+
+def save_config():
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=4)
+
+# ==================== EVENTS ====================
+@bot.event
+async def on_ready():
+    global active_channel
+    print(f'✅ Bot is online as {bot.user}')
+    await tree.sync()
+    await load_phishing_hashes()
+
+    if config.get("warning_channel_id") == 0 and bot.guilds:
+        guild = bot.guilds[0]
+        channels = [ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages]
+        if channels:
+            active_channel = max(channels, key=lambda c: len(c.members) if hasattr(c, 'members') else 0)
+            print(f"📢 Warning channel set to: {active_channel.name}")
+
+# AFK Voice Channel Auto-Mute
+@bot.event
+async def on_voice_state_update(member, before, after):
+    afk_id = config.get("afk_vc_id")
+    if not afk_id:
+        return
+    afk_vc = bot.get_channel(afk_id)
+    if not afk_vc or not isinstance(afk_vc, discord.VoiceChannel):
+        return
+
+    if not afk_vc.guild.me.voice or afk_vc.guild.me.voice.channel != afk_vc:
+        try:
+            await afk_vc.connect()
+        except:
+            pass
+
+    if after.channel and after.channel.id == afk_id:
+        if member.id not in muted_users:
+            try:
+                await member.edit(mute=True, reason="AFK VC - Server Muted")
+                muted_users.add(member.id)
+            except:
+                pass
+
+    elif before.channel and before.channel.id == afk_id and (not after.channel or after.channel.id != afk_id):
+        if member.id in muted_users:
+            try:
+                await member.edit(mute=False, reason="Left AFK VC")
+                muted_users.discard(member.id)
+            except:
+                pass
+
+# Main Message Scanner (with whitelist support)
+@bot.event
+async def on_message(message):
+    global warning_sent
+    if message.author.bot:
+        return
+
+    # Skip whitelisted channels
+    if message.channel.id in config.get("whitelisted_channels", []):
+        return
+
+    content = message.content.lower()
+    deleted = False
+
+    # Check banned words and links
+    if any(word in content for word in config.get("banned_words", [])) or \
+       any(link in content for link in config.get("banned_links", [])):
+        deleted = True
+
+    # Check attachments
+    if message.attachments:
+        for att in message.attachments:
+            filename = att.filename.lower()
+            if any(bad in filename for bad in config.get("banned_image_filenames", [])):
+                deleted = True
+                break
+
+            try:
+                data = await att.read()
+                img_hash = hashlib.md5(data).hexdigest()
+                if img_hash in known_phishing_hashes:
+                    deleted = True
+                    break
+            except:
+                pass
+
+    if deleted:
+        try:
+            await message.delete()
+        except:
+            pass
+
+        warning = f"{message.author.mention} I am moderator bot. I saw your account is hacked. We are receiving phishing image from your account and I am deleting it continuously. Please change your Discord password. Thank you."
+
+        try:
+            await message.channel.send(warning, delete_after=30)
+        except:
+            pass
+
+        if not warning_sent and 'active_channel' in globals():
+            try:
+                await active_channel.send(f"**🚨 Phishing Alert** {warning}")
+                warning_sent = True
+            except:
+                pass
+
+# ==================== COMMANDS ====================
+@tree.command(name="deletemsg", description="Delete last N messages")
+@app_commands.describe(quantity="Number of messages to delete")
+async def deletemsg(interaction: discord.Interaction, quantity: int):
+    if interaction.user.id != config["owner_id"] and not interaction.user.guild_permissions.manage_messages:
+        return await interaction.response.send_message("❌ No permission.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    deleted = await interaction.channel.purge(limit=min(quantity + 1, 100))
+    await interaction.followup.send(f"🗑️ Deleted {len(deleted)-1} messages.", ephemeral=True)
+
+@tree.command(name="deleteusrmsg", description="Delete messages from a user")
+@app_commands.describe(user="Target user", quantity="Number of messages")
+async def deleteusrmsg(interaction: discord.Interaction, user: discord.Member, quantity: int):
+    if interaction.user.id != config["owner_id"] and not interaction.user.guild_permissions.manage_messages:
+        return await interaction.response.send_message("❌ No permission.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    def check(m): return m.author.id == user.id
+    deleted = await interaction.channel.purge(limit=min(quantity + 10, 100), check=check)
+    await interaction.followup.send(f"🗑️ Deleted {len(deleted)} messages from {user}.", ephemeral=True)
+
+@tree.command(name="whitelist", description="Whitelist a channel (text or voice) from auto-moderation")
+@app_commands.describe(channel="Channel to whitelist")
+async def whitelist(interaction: discord.Interaction, channel: discord.abc.GuildChannel):
+    if interaction.user.id != config["owner_id"] and not interaction.user.guild_permissions.manage_guild:
+        return await interaction.response.send_message("❌ No permission.", ephemeral=True)
+
+    if channel.id in config["whitelisted_channels"]:
+        await interaction.response.send_message(f"✅ {channel.mention} is already whitelisted.", ephemeral=True)
+        return
+
+    config["whitelisted_channels"].append(channel.id)
+    save_config()
+    await interaction.response.send_message(f"✅ Successfully whitelisted {channel.mention} from moderation.", ephemeral=True)
+
+# ==================== RUN BOT ====================
+if __name__ == "__main__":
+    if config["token"] == "YOUR_BOT_TOKEN_HERE":
+        print("❌ Please put your real bot token in config.json")
+    else:
+        bot.run(config["token"])
 muted_users = set()
 warning_sent = False
 known_phishing_hashes = set()
